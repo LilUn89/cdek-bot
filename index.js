@@ -55,10 +55,12 @@ async function createCdekOrder(session) {
     tariff_code: 136,
     shipment_point: 'SPB4',
     delivery_point: session.pvzCode,
+    sender: { name: 'Ункуца Лилия Алексеевна' },
     recipient: { name: session.name, phones: [{ number: ph }] },
     packages: [{
       number: 'PKG-' + Date.now(),
       weight: 300, length: 20, width: 20, height: 10,
+      comment: 'Ножницы маникюрные',
       items: [{
         name: 'Ножницы маникюрные',
         ware_key: 'NM-001',
@@ -119,7 +121,20 @@ function parseOrder(text) {
     if (am) city = am[1];
   }
 
-  return { name, phone: phone ? '+' + phone : '', city };
+  // Street + house
+  let street = '';
+  const streetRx = [
+    /(?:ул\.?\s*|улица\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пр\.?\s*|проспект\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пер\.?\s*|переулок\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:наб\.?\s*|набережная\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+  ];
+  for (const rx of streetRx) {
+    const m = text.match(rx);
+    if (m) { street = m[0].trim().replace(/,$/,''); break; }
+  }
+
+  return { name, phone: phone ? '+' + phone : '', city, street };
 }
 
 // ── TELEGRAM ──────────────────────────────────────────────────────────────────
@@ -158,16 +173,18 @@ async function handleMessage(msg) {
     if (text.startsWith('/')) return send(chatId, 'Используйте /new для нового заказа');
 
     const parsed = parseOrder(text);
-    sess.name  = parsed.name;
-    sess.phone = parsed.phone;
-    sess.city  = parsed.city;
-    sess.step  = 'confirm_data';
+    sess.name   = parsed.name;
+    sess.phone  = parsed.phone;
+    sess.city   = parsed.city;
+    sess.street = parsed.street;
+    sess.step   = 'confirm_data';
     sessions[chatId] = sess;
 
     let reply = '🔍 <b>Распознал заказ:</b>\n\n';
     reply += `👤 Имя: <b>${sess.name || '❓ не найдено'}</b>\n`;
     reply += `📱 Телефон: <b>${sess.phone || '❓ не найден'}</b>\n`;
-    reply += `🏙 Город: <b>${sess.city || '❓ не найден'}</b>\n\n`;
+    reply += `🏙 Город: <b>${sess.city || '❓ не найден'}</b>\n`;
+    reply += `🏠 Адрес: <b>${sess.street || 'не указан'}</b>\n\n`;
 
     const missing = [];
     if (!sess.name)  missing.push('имя');
