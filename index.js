@@ -334,6 +334,19 @@ async function handleMessage(msg) {
     ]));
   }
 
+  // ── Step: clarify_city ──
+  if (sess.step === 'clarify_city') {
+    const cityInput = text.trim().replace(/^(г\.|город\s+|с\.\s*|пос\.\s*)/i, '').trim();
+    sess.city = cityInput;
+    sess.step = 'confirm_data';
+    sessions[chatId] = sess;
+    let reply = '🔍 <b>Данные заказа:</b>\n\n' + summaryText(sess) + '\n\nВсё верно?';
+    return send(chatId, reply, keyboard([
+      [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
+      [{ text: '✏️ Исправить', callback_data: 'clarify' }]
+    ]));
+  }
+
   // Any other text during active session — remind user
   if (sess.step && sess.step !== 'wait_order') {
     return send(chatId, 'Используйте кнопки выше или /new для нового заказа');
@@ -363,10 +376,9 @@ async function handleCallback(cb) {
     try {
       const city = await findCity(sess.city);
       if (!city) {
-        // Ask user to clarify city, stay in clarify mode
-        sess.step = 'clarify';
+        sess.step = 'clarify_city';
         sessions[chatId] = sess;
-        return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nНапишите название города точнее:`);
+        return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nНапишите только название города:`);
       }
 
       sess.cityCode = city.code;
