@@ -68,16 +68,8 @@ function distanceKm(lat1, lon1, lat2, lon2) {
 async function findNearestPvz(cityCode, fullAddress) {
   const pvzList = await findAllPvz(cityCode);
   if (!pvzList.length) return null;
-
-  // Try to geocode the recipient address
   const coords = await geocode(fullAddress).catch(() => null);
-
-  if (!coords) {
-    // No coords — return first PVZ
-    return pvzList[0];
-  }
-
-  // Sort by distance
+  if (!coords) return pvzList[0];
   const withDist = pvzList
     .filter(p => p.location?.latitude && p.location?.longitude)
     .map(p => ({
@@ -85,7 +77,6 @@ async function findNearestPvz(cityCode, fullAddress) {
       dist: distanceKm(coords.lat, coords.lon, p.location.latitude, p.location.longitude)
     }))
     .sort((a, b) => a.dist - b.dist);
-
   return withDist[0] || pvzList[0];
 }
 
@@ -127,74 +118,87 @@ async function createCdekOrder(session) {
 // ── PARSE ─────────────────────────────────────────────────────────────────────
 
 function parseOrder(text) {
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  // Normalize: replace multiple spaces with single, keep newlines
+  const normalized = text.replace(/[ \t]+/g, ' ');
+  const lines = normalized.split('\n').map(l => l.trim()).filter(Boolean);
+  // Also split by long runs that contain address-like content (everything in one line)
+  const allText = normalized;
 
-  // Phone
-  const pm = text.match(/(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/);
+  // ── Phone ──
+  const pm = allText.match(/(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/);
   let phone = pm ? pm[0].replace(/\D/g, '') : '';
   if (phone.startsWith('8')) phone = '7' + phone.slice(1);
 
-  // Name: 2-4 Cyrillic words each starting with uppercase
-  // Also handles mixed case like "Гуляева Елена Семёновна"
+  // ── Name ──
+  // Strategy: find 2-3 consecutive Cyrillic capitalized words NOT preceded/followed by address keywords
+  // Works for both multiline and single-line formats
   let name = '';
+
+  // Try line by line first
   for (const line of lines) {
-    if (/\d|http|@|\(|₽|руб|—|->/i.test(line)) continue;
+    if (/\d|http|@|\(|₽|руб|—/i.test(line)) continue;
     const words = line.split(/\s+/);
     if (words.length < 2 || words.length > 4) continue;
-    // Each word: starts with capital Cyrillic, rest lowercase Cyrillic (allow ё and -)
     if (words.every(w => /^[А-ЯЁ][а-яёА-ЯЁ\-]+$/.test(w) && w.length > 1)) {
       name = line;
       break;
     }
   }
 
-  // City
-  let city = '';
-
-  // After postal code pattern: "617220 Пермский край, Карагайский район, с. Козьмодемьянск"
-  const postalLine = text.match(/\d{6}[^\n]+/);
-  if (postalLine) {
-    // Extract last city-like token before street keywords
-    const pl = postalLine[0];
-    // Look for с. г. пос. пгт.
-    const cm = pl.match(/(?:с\.|г\.|пос\.|пгт\.)\s*([А-ЯЁ][а-яё\-]+)/);
-    if (cm) city = cm[1];
-    // Or last comma-separated segment that looks like a city
-    if (!city) {
-      const parts = pl.split(',').map(s => s.trim());
-      for (let i = parts.length - 1; i >= 0; i--) {
-        const p = parts[i].replace(/^(с\.|г\.|пос\.|пгт\.)\s*/i, '').trim();
-        if (/^[А-ЯЁ][а-яё\-]+$/.test(p) && p.length > 2) { city = p; break; }
+  // If not found line by line — scan for FIO pattern in full text
+  // Pattern: 3 capitalized Cyrillic words in a row (Фамилия Имя Отчество)
+  if (!name) {
+    const fioMatch = allText.match(/([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)\s+([А-ЯЁ][а-яё]+)/);
+    if (fioMatch) {
+      // Make sure these are not city/region words
+      const skip = /область|район|край|город|улица|проспект|переулок/i;
+      if (!skip.test(fioMatch[0])) {
+        name = fioMatch[0];
       }
     }
   }
 
-  if (!city) {
-    const cm = text.match(/(?:^|[\s,])(?:г\.|г\s|город\s|с\.|с\s|пос\.|пгт\.)\s*([А-ЯЁ][а-яё\-]+)/m);
-    if (cm) city = cm[1];
-  }
+  // ── City ──
+  let city = '';
 
+  // Pattern: explicit marker г. с. пос. город
+  const cityMarker = allText.match(/(?:^|[\s,])(?:г\.|город\s+|с\.\s*|пос\.\s*|пгт\.\s*)([А-ЯЁ][а-яё\-]+(?:\s[А-ЯЁ][а-яё\-]+)?)/im);
+  if (cityMarker) city = cityMarker[1].trim();
+
+  // Pattern: after postal code — last city-like token
   if (!city) {
-    const regionRx = /край|область|обл\b|район|р-н|округ/i;
-    let afterRegion = false;
-    for (const line of lines) {
-      if (regionRx.test(line)) { afterRegion = true; continue; }
-      if (afterRegion && /^[А-ЯЁ][а-яё\-]+(\s[А-ЯЁ][а-яё\-]+)?$/.test(line)) { city = line; break; }
+    const postalM = allText.match(/\d{6}\s+([^\n\d]+)/);
+    if (postalM) {
+      const parts = postalM[1].split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+      const skip = /^(область|обл|край|район|р-н|округ|ул|улица|пр|проспект|пер|переулок|наб|бул|шоссе|дом|д|кв|квартира)\.?$/i;
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const p = parts[i];
+        if (/^[А-ЯЁ][а-яё\-]+$/.test(p) && p.length > 2 && !skip.test(p)) {
+          city = p; break;
+        }
+      }
     }
   }
 
-  // Street
+  // Pattern: word after region keywords
+  if (!city) {
+    const regionRx = /(?:край|область|обл\b|район|р-н|округ)\s+([А-ЯЁ][а-яё\-]+)/i;
+    const rm = allText.match(regionRx);
+    if (rm) city = rm[1];
+  }
+
+  // ── Street ──
   let street = '';
   const streetRx = [
-    /(?:ул\.?\s*|улица\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:пр\.?\s*|проспект\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:пер\.?\s*|переулок\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:наб\.?\s*|набережная\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:бул\.?\s*|бульвар\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:шоссе\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:ул\.?\s*|улица\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пр\.?\s*|проспект\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пер\.?\s*|переулок\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
+    /(?:наб\.?\s*|набережная\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
+    /(?:бул\.?\s*|бульвар\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
+    /(?:шоссе\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*|дом\s*)?(\d+[\w\/\-]*)/i,
   ];
   for (const rx of streetRx) {
-    const m = text.match(rx);
+    const m = allText.match(rx);
     if (m) { street = m[0].trim().replace(/,\s*$/, ''); break; }
   }
 
@@ -220,48 +224,54 @@ function keyboard(buttons) {
   return { reply_markup: { inline_keyboard: buttons } };
 }
 
+function summaryText(sess) {
+  let t = `👤 Имя: <b>${sess.name || '❓'}</b>\n`;
+  t += `📱 Телефон: <b>${sess.phone || '❓'}</b>\n`;
+  t += `🏙 Город: <b>${sess.city || '❓'}</b>\n`;
+  t += `🏠 Адрес: <b>${sess.street || 'не указан'}</b>`;
+  return t;
+}
+
 // ── FLOW ──────────────────────────────────────────────────────────────────────
 
 async function handleMessage(msg) {
   const chatId = msg.chat.id;
   const text   = (msg.text || '').trim();
-  const sess   = sessions[chatId] || {};
+  let sess     = sessions[chatId] || { step: 'wait_order' };
 
+  // Commands always reset
   if (text === '/start' || text === '/new') {
     sessions[chatId] = { step: 'wait_order' };
     return send(chatId, '📦 <b>Новый заказ СДЭК</b>\n\nВставьте текст заказа в любом формате:');
   }
 
-  if (!sess.step || sess.step === 'wait_order') {
-    if (text.startsWith('/')) return send(chatId, 'Используйте /new для нового заказа');
-
+  // ── Step: wait_order ──
+  if (sess.step === 'wait_order') {
     const parsed = parseOrder(text);
     sess.name   = parsed.name;
     sess.phone  = parsed.phone;
     sess.city   = parsed.city;
     sess.street = parsed.street;
-    sess.step   = 'confirm_data';
-    sessions[chatId] = sess;
-
-    let reply = '🔍 <b>Распознал заказ:</b>\n\n';
-    reply += `👤 Имя: <b>${sess.name || '❓ не найдено'}</b>\n`;
-    reply += `📱 Телефон: <b>${sess.phone || '❓ не найден'}</b>\n`;
-    reply += `🏙 Город: <b>${sess.city || '❓ не найден'}</b>\n`;
-    reply += `🏠 Адрес: <b>${sess.street || 'не указан'}</b>\n\n`;
 
     const missing = [];
     if (!sess.name)  missing.push('имя');
     if (!sess.phone) missing.push('телефон');
     if (!sess.city)  missing.push('город');
 
+    let reply = '🔍 <b>Распознал заказ:</b>\n\n' + summaryText(sess) + '\n\n';
+
     if (missing.length) {
       reply += `⚠️ Не удалось определить: <b>${missing.join(', ')}</b>\n\n`;
       reply += `Напишите недостающее через запятую:\n`;
       reply += `<i>пример: Иванова Мария Петровна, 89001234567, Казань</i>`;
       sess.step = 'clarify';
+      sess.missing = missing;
+      sessions[chatId] = sess;
       return send(chatId, reply);
     }
 
+    sess.step = 'confirm_data';
+    sessions[chatId] = sess;
     reply += 'Всё верно?';
     return send(chatId, reply, keyboard([
       [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
@@ -269,43 +279,64 @@ async function handleMessage(msg) {
     ]));
   }
 
+  // ── Step: clarify ──
+  // User sends missing fields — parse them WITHOUT resetting existing session data
   if (sess.step === 'clarify') {
-    const parts = text.split(',').map(p => p.trim());
+    const parts = text.split(',').map(p => p.trim()).filter(Boolean);
+
     for (const part of parts) {
-      const phoneM = part.match(/[\+7|8]?[\d\s\-\(\)]{10,}/);
-      if (phoneM) {
-        let ph = part.replace(/\D/g, '');
+      // Phone?
+      const phoneM = part.replace(/\D/g, '');
+      if (phoneM.length >= 10) {
+        let ph = phoneM;
         if (ph.startsWith('8')) ph = '7' + ph.slice(1);
+        if (!ph.startsWith('7')) ph = '7' + ph;
         sess.phone = '+' + ph;
         continue;
       }
-      const words = part.split(/\s+/);
-      if (words.length >= 2 && words.every(w => /^[А-ЯЁ][а-яёА-ЯЁ\-]+$/.test(w))) {
-        sess.name = part;
-        continue;
+      // City? (single word)
+      if (/^[А-ЯЁ][а-яё\-]+(\s[А-ЯЁ][а-яё\-]+)?$/.test(part) && part.split(' ').length <= 2) {
+        // If it looks like a city (1-2 words) and we're missing city
+        const words = part.split(' ');
+        if (words.length === 1 && !sess.city) { sess.city = part; continue; }
+        if (words.length === 2 && !sess.city) { sess.city = part; continue; }
       }
-      if (/^[А-ЯЁ][а-яё\-]+(\s[А-ЯЁ][а-яё\-]+)?$/.test(part)) {
-        sess.city = part;
+      // Name? (2-4 capitalized words)
+      const words = part.split(/\s+/);
+      if (words.length >= 2 && words.length <= 4 && words.every(w => /^[А-ЯЁ][а-яёА-ЯЁ\-]+$/.test(w))) {
+        sess.name = part;
         continue;
       }
     }
 
+    const stillMissing = [];
+    if (!sess.name)  stillMissing.push('имя');
+    if (!sess.phone) stillMissing.push('телефон');
+    if (!sess.city)  stillMissing.push('город');
+
+    let reply = '🔍 <b>Данные после уточнения:</b>\n\n' + summaryText(sess) + '\n\n';
+
+    if (stillMissing.length) {
+      reply += `⚠️ Всё ещё не указано: <b>${stillMissing.join(', ')}</b>\n\n`;
+      reply += `Напишите через запятую:\n<i>пример: Иванова Мария Петровна, 89001234567, Казань</i>`;
+      sess.step = 'clarify';
+      sessions[chatId] = sess;
+      return send(chatId, reply);
+    }
+
     sess.step = 'confirm_data';
     sessions[chatId] = sess;
-
-    let reply = '🔍 <b>Данные после уточнения:</b>\n\n';
-    reply += `👤 Имя: <b>${sess.name || '❓'}</b>\n`;
-    reply += `📱 Телефон: <b>${sess.phone || '❓'}</b>\n`;
-    reply += `🏙 Город: <b>${sess.city || '❓'}</b>\n`;
-    reply += `🏠 Адрес: <b>${sess.street || 'не указан'}</b>\n\nВсё верно?`;
-
+    reply += 'Всё верно?';
     return send(chatId, reply, keyboard([
       [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
-      [{ text: '✏️ Исправить ещё раз', callback_data: 'clarify' }]
+      [{ text: '✏️ Исправить', callback_data: 'clarify' }]
     ]));
   }
 
-  return send(chatId, 'Используйте /new для нового заказа');
+  // Any other text during active session — remind user
+  if (sess.step && sess.step !== 'wait_order') {
+    return send(chatId, 'Используйте кнопки выше или /new для нового заказа');
+  }
 }
 
 async function handleCallback(cb) {
@@ -318,20 +349,29 @@ async function handleCallback(cb) {
   if (data === 'clarify') {
     sess.step = 'clarify';
     sessions[chatId] = sess;
-    return send(chatId, '✏️ Напишите исправления через запятую:\n<i>пример: Иванова Мария Петровна, 89001234567, Казань</i>');
+    const missing = [];
+    if (!sess.name)  missing.push('имя');
+    if (!sess.phone) missing.push('телефон');
+    if (!sess.city)  missing.push('город');
+    const hint = missing.length ? `Не хватает: <b>${missing.join(', ')}</b>\n\n` : '';
+    return send(chatId, `✏️ ${hint}Напишите исправления через запятую:\n<i>пример: Иванова Мария Петровна, 89001234567, Казань</i>`);
   }
 
   if (data === 'find_pvz') {
     await send(chatId, '🔎 Ищу ближайший ПВЗ...');
     try {
       const city = await findCity(sess.city);
-      if (!city) return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nУточните название города:`);
+      if (!city) {
+        // Ask user to clarify city, stay in clarify mode
+        sess.step = 'clarify';
+        sessions[chatId] = sess;
+        return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nНапишите название города точнее:`);
+      }
 
       sess.cityCode = city.code;
       sess.city     = city.city;
       sessions[chatId] = sess;
 
-      // Build full address for geocoding
       const fullAddr = [sess.city, sess.street].filter(Boolean).join(', ');
       const pvz = await findNearestPvz(city.code, fullAddr);
 
@@ -351,8 +391,7 @@ async function handleCallback(cb) {
       reply += `🏠 ${sess.pvzAddr}\n`;
       if (sess.pvzDist) reply += `📏 ${sess.pvzDist} от адреса получателя\n`;
       reply += `\n📦 Ножницы маникюрные · 100 ₽\n`;
-      reply += `⚖️ 300 г · 20×20×10 см\n\n`;
-      reply += `Создать заказ?`;
+      reply += `⚖️ 300 г · 20×20×10 см\n\nСоздать заказ?`;
 
       return send(chatId, reply, keyboard([
         [{ text: '🚀 Создать заказ в СДЭК', callback_data: 'create_order' }],
@@ -369,16 +408,13 @@ async function handleCallback(cb) {
     try {
       const pvzList = await findAllPvz(sess.cityCode);
       if (!pvzList.length) return send(chatId, '❌ ПВЗ не найдены');
-
       sess.pvzOptions = pvzList.slice(0, 5);
       sess.step = 'select_pvz';
       sessions[chatId] = sess;
-
       const buttons = sess.pvzOptions.map((pvz, i) => [{
         text: `${i+1}. ${pvz.name} — ${pvz.location?.address || ''}`,
         callback_data: `pvz_${i}`
       }]);
-
       return send(chatId, `📍 <b>ПВЗ в городе ${sess.city}:</b>`, keyboard(buttons));
     } catch(e) {
       return send(chatId, '❌ Ошибка: ' + e.message);
@@ -389,7 +425,6 @@ async function handleCallback(cb) {
     const idx = parseInt(data.split('_')[1]);
     const pvz = sess.pvzOptions?.[idx];
     if (!pvz) return send(chatId, 'Ошибка — попробуйте /new');
-
     sess.pvzCode = pvz.code;
     sess.pvzName = pvz.name;
     sess.pvzAddr = pvz.location?.address || '';
@@ -401,7 +436,6 @@ async function handleCallback(cb) {
     reply += `👤 ${sess.name}\n📱 ${sess.phone}\n\n`;
     reply += `📍 <b>ПВЗ:</b> ${sess.pvzName}\n🏠 ${sess.pvzAddr}\n\n`;
     reply += `📦 Ножницы маникюрные · 100 ₽\n⚖️ 300 г · 20×20×10 см\n\nСоздать заказ?`;
-
     return send(chatId, reply, keyboard([
       [{ text: '🚀 Создать заказ в СДЭК', callback_data: 'create_order' }],
       [{ text: '❌ Отмена', callback_data: 'cancel' }]
