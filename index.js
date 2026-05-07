@@ -7,6 +7,7 @@ const TG_BASE     = `https://api.telegram.org/bot${TG_TOKEN}`;
 
 const SENDER = {
   name: 'Ункуца Лилия Алексеевна',
+  company: 'ИП Ункуца Лилия Алексеевна',
   phones: [{ number: '+79998311989' }]
 };
 
