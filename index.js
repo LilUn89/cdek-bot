@@ -1,12 +1,16 @@
 const TG_TOKEN    = process.env.TG_TOKEN    || '8628262327:AAF-kC9OrUuhT4KxW3emnZgxUrDa2qUnNiQ';
 const CDEK_ID     = process.env.CDEK_ID     || 'YtqLpsCw3XjNX0hs43XbTftU9uLgkRoS';
 const CDEK_SECRET = process.env.CDEK_SECRET || 'sCcpvnrv1jsJM8vexr1Vqm3Q8NW2fmw5';
+const YANDEX_KEY  = process.env.YANDEX_KEY  || '214f0319-065e-42df-b2f8-94abecea1453';
 const CDEK_BASE   = 'https://api.cdek.ru/v2';
 const TG_BASE     = `https://api.telegram.org/bot${TG_TOKEN}`;
 
-let cdekToken = null, cdekTokenExp = 0;
+const SENDER = {
+  name: 'Ункуца Лилия Алексеевна',
+  phones: [{ number: '+79998311989' }]
+};
 
-// In-memory session per chat
+let cdekToken = null, cdekTokenExp = 0;
 const sessions = {};
 
 // ── CDEK ──────────────────────────────────────────────────────────────────────
@@ -34,13 +38,55 @@ async function findCity(cityName) {
   return Array.isArray(d) && d.length ? d[0] : null;
 }
 
-async function findPvz(cityCode) {
+async function findAllPvz(cityCode) {
   const tok = await getCdekToken();
-  const r = await fetch(`${CDEK_BASE}/deliverypoints?city_code=${cityCode}&type=PVZ&size=5`, {
+  const r = await fetch(`${CDEK_BASE}/deliverypoints?city_code=${cityCode}&type=PVZ&size=50`, {
     headers: { Authorization: 'Bearer ' + tok }
   });
   const d = await r.json();
   return Array.isArray(d) ? d : [];
+}
+
+async function geocode(address) {
+  const url = `https://geocode-maps.yandex.ru/1.x/?apikey=${YANDEX_KEY}&format=json&geocode=${encodeURIComponent(address)}&results=1`;
+  const r = await fetch(url);
+  const d = await r.json();
+  const pos = d?.response?.GeoObjectCollection?.featureMember?.[0]?.GeoObject?.Point?.pos;
+  if (!pos) return null;
+  const [lon, lat] = pos.split(' ').map(Number);
+  return { lat, lon };
+}
+
+function distanceKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLon = (lon2 - lon1) * Math.PI / 180;
+  const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+async function findNearestPvz(cityCode, fullAddress) {
+  const pvzList = await findAllPvz(cityCode);
+  if (!pvzList.length) return null;
+
+  // Try to geocode the recipient address
+  const coords = await geocode(fullAddress).catch(() => null);
+
+  if (!coords) {
+    // No coords — return first PVZ
+    return pvzList[0];
+  }
+
+  // Sort by distance
+  const withDist = pvzList
+    .filter(p => p.location?.latitude && p.location?.longitude)
+    .map(p => ({
+      ...p,
+      dist: distanceKm(coords.lat, coords.lon, p.location.latitude, p.location.longitude)
+    }))
+    .sort((a, b) => a.dist - b.dist);
+
+  return withDist[0] || pvzList[0];
 }
 
 async function createCdekOrder(session) {
@@ -55,7 +101,7 @@ async function createCdekOrder(session) {
     tariff_code: 136,
     shipment_point: 'SPB4',
     delivery_point: session.pvzCode,
-    sender: { name: 'Ункуца Лилия Алексеевна' },
+    sender: SENDER,
     recipient: { name: session.name, phones: [{ number: ph }] },
     packages: [{
       number: 'PKG-' + Date.now(),
@@ -81,26 +127,47 @@ async function createCdekOrder(session) {
 // ── PARSE ─────────────────────────────────────────────────────────────────────
 
 function parseOrder(text) {
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
   // Phone
   const pm = text.match(/(?:\+7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}/);
   let phone = pm ? pm[0].replace(/\D/g, '') : '';
   if (phone.startsWith('8')) phone = '7' + phone.slice(1);
 
-  // Name: 2-4 Cyrillic capitalized words, no digits/special
-  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+  // Name: 2-4 Cyrillic words each starting with uppercase
+  // Also handles mixed case like "Гуляева Елена Семёновна"
   let name = '';
   for (const line of lines) {
-    if (/\d|http|@|\(|₽|руб/i.test(line)) continue;
+    if (/\d|http|@|\(|₽|руб|—|->/i.test(line)) continue;
     const words = line.split(/\s+/);
     if (words.length < 2 || words.length > 4) continue;
-    if (words.every(w => /^[А-ЯЁ][а-яё\-]+$/.test(w))) { name = line; break; }
+    // Each word: starts with capital Cyrillic, rest lowercase Cyrillic (allow ё and -)
+    if (words.every(w => /^[А-ЯЁ][а-яёА-ЯЁ\-]+$/.test(w) && w.length > 1)) {
+      name = line;
+      break;
+    }
   }
 
   // City
   let city = '';
-  // After postal code
-  const postal = text.match(/\d{6}[^\n]*(?:,\s*)(?:[^,\n]+,\s*)*(?:с\.\s*|г\.\s*|пос\.\s*|пгт\.\s*)?([А-ЯЁ][а-яё\-]+)/);
-  if (postal) city = postal[1];
+
+  // After postal code pattern: "617220 Пермский край, Карагайский район, с. Козьмодемьянск"
+  const postalLine = text.match(/\d{6}[^\n]+/);
+  if (postalLine) {
+    // Extract last city-like token before street keywords
+    const pl = postalLine[0];
+    // Look for с. г. пос. пгт.
+    const cm = pl.match(/(?:с\.|г\.|пос\.|пгт\.)\s*([А-ЯЁ][а-яё\-]+)/);
+    if (cm) city = cm[1];
+    // Or last comma-separated segment that looks like a city
+    if (!city) {
+      const parts = pl.split(',').map(s => s.trim());
+      for (let i = parts.length - 1; i >= 0; i--) {
+        const p = parts[i].replace(/^(с\.|г\.|пос\.|пгт\.)\s*/i, '').trim();
+        if (/^[А-ЯЁ][а-яё\-]+$/.test(p) && p.length > 2) { city = p; break; }
+      }
+    }
+  }
 
   if (!city) {
     const cm = text.match(/(?:^|[\s,])(?:г\.|г\s|город\s|с\.|с\s|пос\.|пгт\.)\s*([А-ЯЁ][а-яё\-]+)/m);
@@ -112,26 +179,23 @@ function parseOrder(text) {
     let afterRegion = false;
     for (const line of lines) {
       if (regionRx.test(line)) { afterRegion = true; continue; }
-      if (afterRegion && /^[А-ЯЁ][а-яё\-]+$/.test(line)) { city = line; break; }
+      if (afterRegion && /^[А-ЯЁ][а-яё\-]+(\s[А-ЯЁ][а-яё\-]+)?$/.test(line)) { city = line; break; }
     }
   }
 
-  if (!city) {
-    const am = text.match(/([А-ЯЁ][а-яё\-]+)[,\s]+(?:ул\.|пр\.|пер\.|бул\.|шоссе|наб\.)/);
-    if (am) city = am[1];
-  }
-
-  // Street + house
+  // Street
   let street = '';
   const streetRx = [
-    /(?:ул\.?\s*|улица\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:пр\.?\s*|проспект\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:пер\.?\s*|переулок\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
-    /(?:наб\.?\s*|набережная\s+)([А-ЯЁа-яё\s\-]+?)\s*,?\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:ул\.?\s*|улица\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пр\.?\s*|проспект\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:пер\.?\s*|переулок\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:наб\.?\s*|набережная\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:бул\.?\s*|бульвар\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
+    /(?:шоссе\s+)([А-ЯЁа-яё\s\-]+?)\s*(?:д\.?\s*)?(\d+[\w\/\-]*)/i,
   ];
   for (const rx of streetRx) {
     const m = text.match(rx);
-    if (m) { street = m[0].trim().replace(/,$/,''); break; }
+    if (m) { street = m[0].trim().replace(/,\s*$/, ''); break; }
   }
 
   return { name, phone: phone ? '+' + phone : '', city, street };
@@ -168,7 +232,6 @@ async function handleMessage(msg) {
     return send(chatId, '📦 <b>Новый заказ СДЭК</b>\n\nВставьте текст заказа в любом формате:');
   }
 
-  // Waiting for order text
   if (!sess.step || sess.step === 'wait_order') {
     if (text.startsWith('/')) return send(chatId, 'Используйте /new для нового заказа');
 
@@ -192,30 +255,39 @@ async function handleMessage(msg) {
     if (!sess.city)  missing.push('город');
 
     if (missing.length) {
-      reply += `⚠️ Не удалось определить: <b>${missing.join(', ')}</b>\n`;
-      reply += `Уточните — напишите через запятую:\n`;
+      reply += `⚠️ Не удалось определить: <b>${missing.join(', ')}</b>\n\n`;
+      reply += `Напишите недостающее через запятую:\n`;
       reply += `<i>пример: Иванова Мария Петровна, 89001234567, Казань</i>`;
       sess.step = 'clarify';
-    } else {
-      reply += 'Всё верно?';
-      return send(chatId, reply, keyboard([
-        [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
-        [{ text: '✏️ Исправить', callback_data: 'clarify' }]
-      ]));
+      return send(chatId, reply);
     }
 
-    return send(chatId, reply);
+    reply += 'Всё верно?';
+    return send(chatId, reply, keyboard([
+      [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
+      [{ text: '✏️ Исправить', callback_data: 'clarify' }]
+    ]));
   }
 
-  // Clarify missing fields
   if (sess.step === 'clarify') {
     const parts = text.split(',').map(p => p.trim());
     for (const part of parts) {
       const phoneM = part.match(/[\+7|8]?[\d\s\-\(\)]{10,}/);
-      if (phoneM) { sess.phone = part.replace(/\D/g,''); if (sess.phone.startsWith('8')) sess.phone = '7'+sess.phone.slice(1); sess.phone = '+'+sess.phone; continue; }
-      const cyrWords = part.split(/\s+/);
-      if (cyrWords.length >= 2 && cyrWords.every(w => /^[А-ЯЁ][а-яё\-]+$/.test(w))) { sess.name = part; continue; }
-      if (/^[А-ЯЁ][а-яё\-]+$/.test(part)) { sess.city = part; continue; }
+      if (phoneM) {
+        let ph = part.replace(/\D/g, '');
+        if (ph.startsWith('8')) ph = '7' + ph.slice(1);
+        sess.phone = '+' + ph;
+        continue;
+      }
+      const words = part.split(/\s+/);
+      if (words.length >= 2 && words.every(w => /^[А-ЯЁ][а-яёА-ЯЁ\-]+$/.test(w))) {
+        sess.name = part;
+        continue;
+      }
+      if (/^[А-ЯЁ][а-яё\-]+(\s[А-ЯЁ][а-яё\-]+)?$/.test(part)) {
+        sess.city = part;
+        continue;
+      }
     }
 
     sess.step = 'confirm_data';
@@ -224,7 +296,8 @@ async function handleMessage(msg) {
     let reply = '🔍 <b>Данные после уточнения:</b>\n\n';
     reply += `👤 Имя: <b>${sess.name || '❓'}</b>\n`;
     reply += `📱 Телефон: <b>${sess.phone || '❓'}</b>\n`;
-    reply += `🏙 Город: <b>${sess.city || '❓'}</b>\n\nВсё верно?`;
+    reply += `🏙 Город: <b>${sess.city || '❓'}</b>\n`;
+    reply += `🏠 Адрес: <b>${sess.street || 'не указан'}</b>\n\nВсё верно?`;
 
     return send(chatId, reply, keyboard([
       [{ text: '✅ Верно, найти ПВЗ', callback_data: 'find_pvz' }],
@@ -249,30 +322,66 @@ async function handleCallback(cb) {
   }
 
   if (data === 'find_pvz') {
-    await send(chatId, '🔎 Ищу ПВЗ в городе ' + sess.city + '...');
+    await send(chatId, '🔎 Ищу ближайший ПВЗ...');
     try {
       const city = await findCity(sess.city);
-      if (!city) return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nНапишите город ещё раз:`);
+      if (!city) return send(chatId, `❌ Город «${sess.city}» не найден в базе СДЭК.\n\nУточните название города:`);
 
-      sess.cityCode  = city.code;
-      sess.city      = city.city;
-      const pvzList  = await findPvz(city.code);
+      sess.cityCode = city.code;
+      sess.city     = city.city;
+      sessions[chatId] = sess;
 
-      if (!pvzList.length) return send(chatId, `❌ ПВЗ не найдены в городе ${city.city}.\n\nВозможно, доставка туда недоступна.`);
+      // Build full address for geocoding
+      const fullAddr = [sess.city, sess.street].filter(Boolean).join(', ');
+      const pvz = await findNearestPvz(city.code, fullAddr);
+
+      if (!pvz) return send(chatId, `❌ ПВЗ не найдены в городе ${city.city}.`);
+
+      sess.pvzCode = pvz.code;
+      sess.pvzName = pvz.name;
+      sess.pvzAddr = pvz.location?.address || '';
+      sess.pvzDist = pvz.dist ? pvz.dist.toFixed(1) + ' км' : null;
+      sess.step    = 'confirm_order';
+      sessions[chatId] = sess;
+
+      let reply = '📋 <b>Итоговые данные заказа:</b>\n\n';
+      reply += `👤 ${sess.name}\n`;
+      reply += `📱 ${sess.phone}\n\n`;
+      reply += `📍 <b>ПВЗ:</b> ${sess.pvzName}\n`;
+      reply += `🏠 ${sess.pvzAddr}\n`;
+      if (sess.pvzDist) reply += `📏 ${sess.pvzDist} от адреса получателя\n`;
+      reply += `\n📦 Ножницы маникюрные · 100 ₽\n`;
+      reply += `⚖️ 300 г · 20×20×10 см\n\n`;
+      reply += `Создать заказ?`;
+
+      return send(chatId, reply, keyboard([
+        [{ text: '🚀 Создать заказ в СДЭК', callback_data: 'create_order' }],
+        [{ text: '🔄 Другой ПВЗ', callback_data: 'show_pvz_list' }],
+        [{ text: '❌ Отмена', callback_data: 'cancel' }]
+      ]));
+    } catch(e) {
+      return send(chatId, '❌ Ошибка: ' + e.message);
+    }
+  }
+
+  if (data === 'show_pvz_list') {
+    await send(chatId, '📍 Загружаю список ПВЗ...');
+    try {
+      const pvzList = await findAllPvz(sess.cityCode);
+      if (!pvzList.length) return send(chatId, '❌ ПВЗ не найдены');
 
       sess.pvzOptions = pvzList.slice(0, 5);
       sess.step = 'select_pvz';
       sessions[chatId] = sess;
 
-      let reply = `📍 <b>ПВЗ в городе ${city.city}:</b>\n\nВыберите один:`;
       const buttons = sess.pvzOptions.map((pvz, i) => [{
         text: `${i+1}. ${pvz.name} — ${pvz.location?.address || ''}`,
         callback_data: `pvz_${i}`
       }]);
 
-      return send(chatId, reply, keyboard(buttons));
+      return send(chatId, `📍 <b>ПВЗ в городе ${sess.city}:</b>`, keyboard(buttons));
     } catch(e) {
-      return send(chatId, '❌ Ошибка СДЭК: ' + e.message);
+      return send(chatId, '❌ Ошибка: ' + e.message);
     }
   }
 
@@ -281,20 +390,17 @@ async function handleCallback(cb) {
     const pvz = sess.pvzOptions?.[idx];
     if (!pvz) return send(chatId, 'Ошибка — попробуйте /new');
 
-    sess.pvzCode  = pvz.code;
-    sess.pvzName  = pvz.name;
-    sess.pvzAddr  = pvz.location?.address || '';
-    sess.step = 'confirm_order';
+    sess.pvzCode = pvz.code;
+    sess.pvzName = pvz.name;
+    sess.pvzAddr = pvz.location?.address || '';
+    sess.pvzDist = null;
+    sess.step    = 'confirm_order';
     sessions[chatId] = sess;
 
     let reply = '📋 <b>Итоговые данные заказа:</b>\n\n';
-    reply += `👤 ${sess.name}\n`;
-    reply += `📱 ${sess.phone}\n`;
-    reply += `📍 ПВЗ: ${sess.pvzName}\n`;
-    reply += `🏠 ${sess.pvzAddr}\n\n`;
-    reply += `📦 Ножницы маникюрные · 100 ₽\n`;
-    reply += `⚖️ 300 г · 20×20×10 см\n\n`;
-    reply += `Создать заказ?`;
+    reply += `👤 ${sess.name}\n📱 ${sess.phone}\n\n`;
+    reply += `📍 <b>ПВЗ:</b> ${sess.pvzName}\n🏠 ${sess.pvzAddr}\n\n`;
+    reply += `📦 Ножницы маникюрные · 100 ₽\n⚖️ 300 г · 20×20×10 см\n\nСоздать заказ?`;
 
     return send(chatId, reply, keyboard([
       [{ text: '🚀 Создать заказ в СДЭК', callback_data: 'create_order' }],
@@ -307,15 +413,15 @@ async function handleCallback(cb) {
     try {
       const result = await createCdekOrder(sess);
       if (result.entity?.uuid) {
-        const num = result.entity.cdek_number || '(присваивается)';
         sessions[chatId] = { step: 'wait_order' };
         let reply = `✅ <b>Заказ создан!</b>\n\n`;
-        reply += `📌 Номер СДЭК: <b>${num}</b>\n`;
+        reply += `📌 Номер СДЭК: <b>${result.entity.cdek_number || '(присваивается)'}</b>\n`;
         reply += `🔑 UUID: <code>${result.entity.uuid}</code>\n\n`;
         reply += `Для нового заказа нажмите /new`;
         return send(chatId, reply);
-      } else if (result.errors?.length) {
-        return send(chatId, '❌ Ошибка СДЭК:\n' + result.errors.map(e => e.message).join('\n'));
+      } else if (result.requests?.[0]?.errors?.length) {
+        const errs = result.requests[0].errors.map(e => e.message).join('\n');
+        return send(chatId, '❌ Ошибка СДЭК:\n' + errs);
       } else {
         return send(chatId, '❌ Неожиданный ответ:\n' + JSON.stringify(result).slice(0, 300));
       }
@@ -341,8 +447,8 @@ const server = http.createServer(async (req, res) => {
     req.on('end', async () => {
       try {
         const update = JSON.parse(body);
-        if (update.message)            await handleMessage(update.message);
-        if (update.callback_query)     await handleCallback(update.callback_query);
+        if (update.message)        await handleMessage(update.message);
+        if (update.callback_query) await handleCallback(update.callback_query);
       } catch(e) { console.error('Update error:', e); }
       res.writeHead(200);
       res.end('ok');
